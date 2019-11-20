@@ -800,6 +800,101 @@ class BertForPreTraining(BertPreTrainedModel):
 
         return outputs  # (loss), prediction_scores, seq_relationship_score, (hidden_states), (attentions)
 
+@add_start_docstrings("""Bert Model with a `language modeling` and a `label achieved` head on top. """,
+                      BERT_START_DOCSTRING,
+                      BERT_INPUTS_DOCSTRING)
+class BertForDialogMaskedLM(BertPreTrainedModel):
+    r"""
+        **masked_lm_labels**: (`optional`) ``torch.LongTensor`` of shape ``(batch_size, sequence_length)``:
+            Labels for computing the masked language modeling loss.
+            Indices should be in ``[-1, 0, ..., config.vocab_size]`` (see ``input_ids`` docstring)
+            Tokens with indices set to ``-1`` are ignored (masked), the loss is only computed for the tokens with labels
+            in ``[0, ..., config.vocab_size]``
+        **lm_labels**: (`optional`) ``torch.LongTensor`` of shape ``(batch_size, sequence_length)``:
+            Labels for computing the left-to-right language modeling loss (next word prediction).
+            Indices should be in ``[-1, 0, ..., config.vocab_size]`` (see ``input_ids`` docstring)
+            Tokens with indices set to ``-1`` are ignored (masked), the loss is only computed for the tokens with labels
+            in ``[0, ..., config.vocab_size]``
+        **achieved_label**: (`optional`) ``torch.LongTensor`` of shape ``(batch_size,)``:
+            Labels for computing the dialog goal achieved prediction (classification) loss.
+            Indices should be in ``[-1, 0, 1]``.
+            ``-1`` are ignored,
+            ``0`` indicates not achieved,
+            ``1`` indicates achieved.
+
+    Outputs: `Tuple` comprising various elements depending on the configuration (config) and inputs:
+        **masked_lm_loss**: (`optional`, returned when ``masked_lm_labels`` is provided) ``torch.FloatTensor`` of shape ``(1,)``:
+            Masked language modeling loss.
+        **ltr_lm_loss**: (`optional`, returned when ``lm_labels`` is provided) ``torch.FloatTensor`` of shape ``(1,)``:
+            Next token prediction loss.
+        **prediction_scores**: ``torch.FloatTensor`` of shape ``(batch_size, sequence_length, config.vocab_size)``
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+        **hidden_states**: (`optional`, returned when ``config.output_hidden_states=True``)
+            list of ``torch.FloatTensor`` (one for the output of each layer + the output of the embeddings)
+            of shape ``(batch_size, sequence_length, hidden_size)``:
+            Hidden-states of the model at the output of each layer plus the initial embedding outputs.
+        **attentions**: (`optional`, returned when ``config.output_attentions=True``)
+            list of ``torch.FloatTensor`` (one for each layer) of shape ``(batch_size, num_heads, sequence_length, sequence_length)``:
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention heads.
+
+    Examples::
+
+        tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        model = BertForMaskedLM.from_pretrained('bert-base-uncased')
+        input_ids = torch.tensor(tokenizer.encode("Hello, my dog is cute")).unsqueeze(0)  # Batch size 1
+        outputs = model(input_ids, masked_lm_labels=input_ids)
+        loss, goal_scores, prediction_scores = outputs[:2]
+
+    """
+    def __init__(self, config):
+        super(BertForDialogMaskedLM, self).__init__(config)
+
+        self.bert = BertModel(config)
+        self.cls = BertOnlyMLMHead(config)
+        self.goal = BertOnlyNSPHead(config)
+
+        self.init_weights()
+
+    def get_output_embeddings(self):
+        return self.cls.predictions.decoder
+
+    def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, position_ids=None, head_mask=None, inputs_embeds=None,
+                masked_lm_labels=None, encoder_hidden_states=None, encoder_attention_mask=None, achieved_label=None):
+
+        outputs = self.bert(input_ids,
+                            attention_mask=attention_mask,
+                            token_type_ids=token_type_ids,
+                            position_ids=position_ids,
+                            head_mask=head_mask,
+                            inputs_embeds=inputs_embeds,
+                            encoder_hidden_states=encoder_hidden_states,
+                            encoder_attention_mask=encoder_attention_mask)
+
+        sequence_output = outputs[0]
+        dialog_output = sequence_output[:, 0]
+        prediction_scores = self.cls(sequence_output)
+        goal_scores = self.goal(dialog_output)
+
+        outputs = (goal_scores, prediction_scores, ) + outputs[2:]  # Add hidden states and attention if they are here
+
+        # Although this may seem awkward, BertForMaskedLM supports two scenarios:
+        # 1. If a tensor that contains the indices of masked labels is provided,
+        #    the cross-entropy is the MLM cross-entropy that measures the likelihood
+        #    of predictions for masked words.
+        # 2. If `lm_labels` is provided we are in a causal scenario where we
+        #    try to predict the next token for each input in the decoder.
+        if masked_lm_labels is not None:
+            loss_fct = CrossEntropyLoss(ignore_index=-1)  # -1 index = padding token
+            masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), masked_lm_labels.view(-1))
+            outputs = (masked_lm_loss,) + outputs
+
+        if achieved_label is not None:
+            loss_fct = CrossEntropyLoss(ignore_index=-1)
+            goal_loss = loss_fct(goal_scores.view(-1, 2), achieved_label.view(-1))
+            outputs = (goal_loss, ) + outputs
+
+        return outputs  # (goal_loss), (lm_loss), goal_scores, prediction_scores, (hidden_states), (attentions)
+
 
 @add_start_docstrings("""Bert Model with a `language modeling` head on top. """,
                       BERT_START_DOCSTRING,
