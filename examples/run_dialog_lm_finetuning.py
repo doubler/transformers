@@ -77,6 +77,8 @@ class TextDataset(Dataset):
             self.examples = []
             with open(file_path, encoding="utf-8") as f:
                 if args.model_type == 'bert_dialog':
+                    user_role_id = tokenizer.convert_tokens_to_ids('[ROLE_1]')
+                    agent_role_id = tokenizer.convert_tokens_to_ids('[ROLE_2]')
                     for line in f:
                         line = line.strip()
                         if not line:
@@ -84,12 +86,31 @@ class TextDataset(Dataset):
                         achieved_label, text = line.split('\t')
                         achieved_label = int(achieved_label)
                         tokenized_text = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(text))
-                        if len(tokenized_text) > block_size - 2:
+                        tokenized_text = tokenizer.build_inputs_with_special_tokens(tokenized_text)
+                        if len(tokenized_text) > block_size:
                             achieved_label = -1
-                            tokenized_text = tokenized_text[:block_size - 2]
+                            tokenized_text = tokenized_text[:block_size]
+                            mask = [1] * block_size
                         else:
-                            tokenized_text = tokenized_text + [tokenizer.pad_token_id] * (block_size - 2 - len(tokenized_text))
-                        self.examples.append([achieved_label] + tokenizer.build_inputs_with_special_tokens(tokenized_text))
+                            padding = (block_size - len(tokenized_text)) * [0]
+                            mask = [1] * len(tokenized_text) + padding
+                            tokenized_text = tokenized_text + padding
+                        np_tokens = np.array(tokenized_text)
+                        indexes_user_role = (np_tokens == user_role_id).nonzero()[0]
+                        indexes_agent_role = (np_tokens == agent_role_id).nonzero()[0]
+                        type_ids = np.zeros((block_size,), dtype=np.int)
+                        start_i = 0
+                        for index_agent in indexes_agent_role:
+                            if indexes_user_role.size < 0 or index_agent > indexes_user_role[-1]:
+                                type_ids[index_agent:] = 1
+                                break
+                            for i in range(start_i, len(indexes_user_role)):
+                                if indexes_user_role[i] > index_agent:
+                                    type_ids[index_agent: indexes_user_role[i]] = 1
+                                    start_i = i
+                                    break
+                        assert len(type_ids) == len(mask) == len(tokenized_text) == block_size
+                        self.examples.append([achieved_label] + tokenized_text + type_ids.tolist() + mask)
                     logger.info(f"bert_dialog total example num: {len(self.examples)}")
                 else:
                     text = f.read()
@@ -157,12 +178,16 @@ def _rotate_checkpoints(args, checkpoint_prefix, use_mtime=False):
 def mask_tokens(inputs, tokenizer, args):
     if args.model_type == 'bert_dialog':
         achieved_label, inputs = inputs[:, 0], inputs[:, 1:]
+        inputs, type_ids, mask_ids = inputs.split(args.block_size, -1)
+        assert inputs.size() == type_ids.size() == mask_ids.size()
+
     """ Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original. """
     labels = inputs.clone()
     # We sample a few tokens in each sequence for masked-LM training (with probability args.mlm_probability defaults to 0.15 in Bert/RoBERTa)
     probability_matrix = torch.full(labels.shape, args.mlm_probability)
     special_tokens_mask = [tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()]
     probability_matrix.masked_fill_(torch.tensor(special_tokens_mask, dtype=torch.bool), value=0.0)
+    probability_matrix.masked_fill_(mask_ids==0, value=0.0)
     masked_indices = torch.bernoulli(probability_matrix).bool()
     labels[~masked_indices] = -1  # We only compute loss on masked tokens
 
@@ -177,7 +202,7 @@ def mask_tokens(inputs, tokenizer, args):
 
     # The rest of the time (10% of the time) we keep the masked input tokens unchanged
     if args.model_type == 'bert_dialog':
-        return inputs, labels, achieved_label
+        return labels, achieved_label, inputs, type_ids, mask_ids
     return inputs, labels
 
 
@@ -242,15 +267,17 @@ def train(args, train_dataset, model, tokenizer):
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
             if args.model_type == 'bert_dialog':
-                inputs, labels, achieved_label = mask_tokens(batch, tokenizer, args) if args.mlm else (batch, batch)
+                labels, achieved_label, inputs, type_ids, mask_ids = mask_tokens(batch, tokenizer, args)
                 achieved_label = achieved_label.to(args.device)
+                type_ids = type_ids.to(args.device)
+                mask_ids = mask_ids.to(args.device)
             else:
                 inputs, labels = mask_tokens(batch, tokenizer, args) if args.mlm else (batch, batch)
             inputs = inputs.to(args.device)
             labels = labels.to(args.device)
             model.train()
             if args.model_type == 'bert_dialog':
-                outputs = model(inputs, masked_lm_labels=labels, achieved_label=achieved_label) if args.mlm else model(inputs, labels=labels, achieved_label=achieved_label)
+                outputs = model(inputs, masked_lm_labels=labels, achieved_label=achieved_label, attention_mask=mask_ids, token_type_ids=type_ids)
                 achieved_loss, lm_loss, achieved_logits = outputs[0], outputs[1], outputs[2]
                 if args.n_gpu > 1:
                     loss = torch.cat((achieved_loss * args.achieved_loss_weight, lm_loss))
@@ -358,8 +385,10 @@ def evaluate(args, model, tokenizer, prefix=""):
 
     for batch in tqdm(eval_dataloader, desc="Evaluating"):
         if args.model_type == 'bert_dialog':
-            inputs, labels, achieved_label = mask_tokens(batch, tokenizer, args) if args.mlm else (batch, batch)
+            labels, achieved_label, inputs, type_ids, mask_ids = mask_tokens(batch, tokenizer, args)
             achieved_label = achieved_label.to(args.device)
+            type_ids = type_ids.to(args.device)
+            mask_ids = mask_ids.to(args.device)
         else:
             inputs, labels = mask_tokens(batch, tokenizer, args) if args.mlm else (batch, batch)
         inputs = inputs.to(args.device)
@@ -367,7 +396,7 @@ def evaluate(args, model, tokenizer, prefix=""):
 
         with torch.no_grad():
             if args.model_type == 'bert_dialog':
-                outputs = model(inputs, masked_lm_labels=labels, achieved_label=achieved_label) if args.mlm else model(inputs, labels=labels, achieved_label=achieved_label)
+                outputs = model(inputs, masked_lm_labels=labels, achieved_label=achieved_label, attention_mask=mask_ids, token_type_ids=type_ids)
                 lm_loss, achieved_logits = outputs[1], outputs[2]
                 right_num = (achieved_logits.max(-1)[1] == achieved_label).sum()
                 ignore_num = (achieved_label == -1).sum()
@@ -496,7 +525,7 @@ def main():
     parser.add_argument('--server_port', type=str, default='', help="For distant debugging.")
     args = parser.parse_args()
 
-    if args.model_type in ["bert", "roberta", "distilbert"] and not args.mlm:
+    if args.model_type in ["bert", "roberta", "distilbert", "bert_dialog"] and not args.mlm:
         raise ValueError("BERT and RoBERTa do not have LM heads but masked LM heads. They must be run using the --mlm "
                          "flag (masked language modeling).")
     if args.eval_data_file is None and args.do_eval:
