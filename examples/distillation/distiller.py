@@ -17,6 +17,8 @@
 """
 import os
 import math
+from typing import Union
+
 import psutil
 import time
 from tqdm import trange, tqdm
@@ -44,7 +46,7 @@ from grouped_batch_sampler import GroupedBatchSampler, create_lengths_groups
 class Distiller:
     def __init__(self,
                  params: dict,
-                 dataset: LmSeqsDataset,
+                 dataset: Union[LmSeqsDataset, np.ndarray],
                  token_probs: torch.tensor,
                  student: nn.Module,
                  teacher: nn.Module):
@@ -53,6 +55,7 @@ class Distiller:
         self.dump_path = params.dump_path
         self.multi_gpu = params.multi_gpu
         self.fp16 = params.fp16
+        self.dialog = True if params.teacher_type == 'bert_dialog' else False
 
         self.student = student
         self.teacher = teacher
@@ -71,9 +74,13 @@ class Distiller:
         else:
             sampler = BatchSampler(sampler=sampler, batch_size=params.batch_size, drop_last=False)
 
-        self.dataloader = DataLoader(dataset=dataset,
-                                     batch_sampler=sampler,
-                                     collate_fn=dataset.batch_sequences)
+        if self.dialog:
+            self.dataloader = DataLoader(dataset=dataset,
+                                         batch_sampler=sampler)
+        else:
+            self.dataloader = DataLoader(dataset=dataset,
+                                         batch_sampler=sampler,
+                                         collate_fn=dataset.batch_sequences)
 
         self.temperature = params.temperature
         assert self.temperature > 0.
@@ -171,6 +178,51 @@ class Distiller:
             self.tensorboard = SummaryWriter(log_dir=os.path.join(self.dump_path, 'log', 'train'))
             self.tensorboard.add_text(tag='config/training', text_string=str(self.params), global_step=0)
             self.tensorboard.add_text(tag='config/student', text_string=str(self.student_config), global_step=0)
+
+    def prepare_batch_mlm_dialog(self,
+                                 batch):
+        """
+        Prepare the batch: from the label, token_ids, type_ids, masks, compute the attention mask and the masked label for MLM.
+
+        Input:
+        ------
+            batch: `Tuple`
+                token_ids: `torch.tensor(bs, seq_length)` - The token ids for each of the sequence. It is padded.
+                lengths: `torch.tensor(bs)` - The lengths of each of the sequences in the batch.
+
+        Output:
+        -------
+            token_ids: `torch.tensor(bs, seq_length)` - The token ids after the modifications for MLM.
+            attn_mask: `torch.tensor(bs, seq_length)` - The attention mask for the self-attention.
+            mlm_labels: `torch.tensor(bs, seq_length)` - The masked languge modeling labels. There is a -1 where there is nothing to predict.
+        """
+        achieved_label, inputs = batch[:, 0], batch[:, 1:]
+        assert inputs.size(-1) % 3 == 0
+        inputs, type_ids, mask_ids = inputs.split(inputs.size(-1)//3, -1)
+        assert inputs.size() == type_ids.size() == mask_ids.size()
+
+        """ Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original. """
+        labels = inputs.clone()
+        # We sample a few tokens in each sequence for masked-LM training (with probability args.mlm_probability defaults to 0.15 in Bert/RoBERTa)
+        probability_matrix = torch.full(labels.shape, self.mlm_mask_prop)
+        special_tokens_mask = [self.params.tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in
+                               labels.tolist()]
+        probability_matrix.masked_fill_(torch.tensor(special_tokens_mask, dtype=torch.bool), value=0.0)
+        probability_matrix.masked_fill_(mask_ids == 0, value=0.0)
+        masked_indices = torch.bernoulli(probability_matrix).bool()
+        labels[~masked_indices] = -1  # We only compute loss on masked tokens
+
+        # 80% of the time, we replace masked input tokens with tokenizer.mask_token ([MASK])
+        indices_replaced = torch.bernoulli(torch.full(labels.shape, self.params.word_mask)).bool() & masked_indices
+        inputs[indices_replaced] = self.params.tokenizer.convert_tokens_to_ids(self.params.tokenizer.mask_token)
+
+        # 10% of the time, we replace masked input tokens with random word
+        indices_random = torch.bernoulli(torch.full(labels.shape, self.params.word_rand/(1-self.params.word_mask))).bool() & masked_indices & ~indices_replaced
+        random_words = torch.randint(len(self.params.tokenizer), labels.shape, dtype=torch.long)
+        inputs[indices_random] = random_words[indices_random]
+
+        # The rest of the time (10% of the time) we keep the masked input tokens unchanged
+        return labels, achieved_label, inputs, type_ids, mask_ids
 
     def prepare_batch_mlm(self,
                           batch):
@@ -328,13 +380,23 @@ class Distiller:
             iter_bar = tqdm(self.dataloader, desc="-Iter", disable=self.params.local_rank not in [-1, 0])
             for batch in iter_bar:
                 if self.params.n_gpu > 0:
-                    batch = tuple(t.to(f'cuda:{self.params.local_rank}') for t in batch)
+                    if not self.dialog:
+                        # batch = batch.to(f'cuda:{self.params.local_rank}')
+                        batch = tuple(t.to(f'cuda:{self.params.local_rank}') for t in batch)
 
-                if self.mlm:
-                    token_ids, attn_mask, lm_labels = self.prepare_batch_mlm(batch=batch)
+                if self.dialog:
+                    lm_labels, achieved_label, token_ids, type_ids, mask_ids = self.prepare_batch_mlm_dialog(batch=batch)
+                    token_ids = token_ids.to(f'cuda:{self.params.local_rank}')
+                    mask_ids = mask_ids.to(torch.bool).to(f'cuda:{self.params.local_rank}')
+                    lm_labels = lm_labels.to(f'cuda:{self.params.local_rank}')
+                    type_ids = type_ids.to(f'cuda:{self.params.local_rank}')
+                    self.step(input_ids=token_ids, attention_mask=mask_ids, lm_labels=lm_labels, type_ids=type_ids)
                 else:
-                    token_ids, attn_mask, lm_labels = self.prepare_batch_clm(batch=batch)
-                self.step(input_ids=token_ids, attention_mask=attn_mask, lm_labels=lm_labels)
+                    if self.mlm:
+                        token_ids, attn_mask, lm_labels = self.prepare_batch_mlm(batch=batch)
+                    else:
+                        token_ids, attn_mask, lm_labels = self.prepare_batch_clm(batch=batch)
+                    self.step(input_ids=token_ids, attention_mask=attn_mask, lm_labels=lm_labels)
 
                 iter_bar.update()
                 iter_bar.set_postfix({'Last_loss': f'{self.last_loss:.2f}',
@@ -352,7 +414,9 @@ class Distiller:
     def step(self,
              input_ids: torch.tensor,
              attention_mask: torch.tensor,
-             lm_labels: torch.tensor):
+             lm_labels: torch.tensor,
+             type_ids: torch.tensor=None,
+             ):
         """
         One optimization step: forward of student AND teacher, backward on the loss (for gradient accumulation),
         and possibly a parameter update (depending on the gradient accumulation).
@@ -363,7 +427,11 @@ class Distiller:
         attention_mask: `torch.tensor(bs, seq_length)` - The attention mask for self attention.
         lm_labels: `torch.tensor(bs, seq_length)` - The language modeling labels (mlm labels for MLM and clm labels for CLM).
         """
-        if self.mlm:
+        if self.dialog:
+            _, s_logits, s_hidden_states = self.student(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=type_ids)     # (bs, seq_length, voc_size)
+            with torch.no_grad():
+                _, t_logits, t_hidden_states = self.teacher(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=type_ids) # (bs, seq_length, voc_size)
+        elif self.mlm:
             s_logits, s_hidden_states = self.student(input_ids=input_ids, attention_mask=attention_mask)     # (bs, seq_length, voc_size)
             with torch.no_grad():
                 t_logits, t_hidden_states = self.teacher(input_ids=input_ids, attention_mask=attention_mask) # (bs, seq_length, voc_size)

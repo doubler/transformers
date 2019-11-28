@@ -32,16 +32,23 @@ if __name__ == '__main__':
     parser.add_argument("--token_counts_dump", type=str, default="data/token_counts.bert-base-uncased.pickle",
                         help="The dump file.")
     parser.add_argument("--vocab_size", default=30522, type=int)
+    parser.add_argument("--bert_dialog", action='store_true', help="dialog model")
     args = parser.parse_args()
 
     logger.info(f'Loading data from {args.data_file}')
     with open(args.data_file, 'rb') as fp:
         data = pickle.load(fp)
 
-    logger.info('Counting occurences for MLM.')
     counter = Counter()
-    for tk_ids in data:
-        counter.update(tk_ids)
+    if args.bert_dialog:
+        logger.info('Counting occurences for dialog MLM.')
+        for inputs in data:
+            assert (len(inputs) - 1) % 3 == 0
+            counter.update(inputs[1: (len(inputs)-1)//3 + 1])
+    else:
+        logger.info('Counting occurences for MLM.')
+        for tk_ids in data:
+            counter.update(tk_ids)
     counts = [0]*args.vocab_size
     for k, v in counter.items():
         counts[k] = v
