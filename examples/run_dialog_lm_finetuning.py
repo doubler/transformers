@@ -104,7 +104,7 @@ class TextDataset(Dataset):
                         type_ids = np.zeros((block_size,), dtype=np.int)
                         start_i = 0
                         for index_agent in indexes_agent_role:
-                            if indexes_user_role.size < 0 or index_agent > indexes_user_role[-1]:
+                            if indexes_user_role.size <= 0 or index_agent > indexes_user_role[-1]:
                                 type_ids[index_agent:] = 1
                                 break
                             for i in range(start_i, len(indexes_user_role)):
